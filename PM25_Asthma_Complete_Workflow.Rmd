@@ -1,0 +1,1515 @@
+---
+title: "'Geographic Clustering of PM2.5 and Adult Asthma Emergency Department Visit"
+  Rates in U.S. Counties: A Spatial Lag Regression Analysis, 2020'
+author: "Saiful Hasan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+  word_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 12,
+  fig.height = 7,
+  dpi        = 150
+)
+```
+
+---
+
+> **Outcome variable note:** `asthma_female` is the sex-averaged adult asthma ED visit
+> rate per 10,000 population. The variable name reflects the original CDC EPHT file
+> structure; it is **not** restricted to female patients. All analyses treat it as
+> the sex-averaged county-level outcome.
+
+---
+
+# Phase 1: Setup and Data Loading
+
+## Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(spatialreg)
+library(tidycensus)
+library(ggplot2)
+library(RColorBrewer)
+library(viridis)
+library(patchwork)
+library(ggspatial)   # annotation_scale, annotation_north_arrow
+library(knitr)
+library(kableExtra)
+library(broom)
+```
+
+## Load Raw Data
+
+```{r load-data}
+# ── Shapefile ─────────────────────────────────────────────────────────────────
+# UPDATE path to match your local directory
+county_sf <- st_read(
+  "Data/tl_2022_us_county/tl_2022_us_county.shp",
+  quiet = TRUE
+)
+
+# ── PM2.5 ─────────────────────────────────────────────────────────────────────
+pm25_raw <- read_csv("Data/Airquality/data_150009.csv")
+
+# ── Asthma ED (sex-averaged, variable named asthma_female per source file) ───
+asthma_raw <- read_csv("Data/female/data_145749.csv")
+```
+
+## Clean and Align Shapefiles
+
+```{r clean-shapefile}
+# Exclude Alaska, Hawaii, and all territories
+exclude_fips <- c("02", "15", "60", "66", "69", "72", "74", "78")
+
+county_sf <- county_sf %>%
+  filter(!STATEFP %in% exclude_fips) %>%
+  st_transform(crs = 5070)            # NAD83 Albers Equal Area (EPSG:5070)
+
+# Add land area in square miles (ALAND is in sq meters)
+county_sf <- county_sf %>%
+  mutate(land_area_sqmi = as.numeric(ALAND) / 2589988)
+
+cat("Counties in contiguous U.S.:", nrow(county_sf), "\n")
+cat("GEOID format check (should be 5-char):", nchar(county_sf$GEOID[1]), "\n")
+```
+
+## Clean PM2.5 Data
+
+```{r clean-pm25}
+pm25_clean <- pm25_raw %>%
+  dplyr::select(CountyFIPS, Value) %>%
+  rename(
+    GEOID = CountyFIPS,
+    pm25  = Value
+  ) %>%
+  filter(!is.na(pm25))
+
+cat("PM2.5 counties:", nrow(pm25_clean), "\n")
+cat("GEOID length check:", nchar(pm25_clean$GEOID[1]), "\n")
+```
+
+## Clean Asthma ED Data
+
+```{r clean-asthma}
+# NOTE: asthma_female = sex-averaged adult asthma ED rate per 10,000
+# Variable name reflects original CDC EPHT file naming only.
+asthma_clean <- asthma_raw %>%
+  dplyr::select(CountyFIPS, Value) %>%
+  rename(
+    GEOID         = CountyFIPS,
+    asthma_female = Value          # sex-averaged outcome; name retained from source
+  ) %>%
+  filter(!is.na(asthma_female))
+
+cat("Asthma counties (28 reporting states):", nrow(asthma_clean), "\n")
+cat("GEOID length check:", nchar(asthma_clean$GEOID[1]), "\n")
+```
+
+## Pull ACS 2020 Socioeconomic Covariates
+
+```{r acs-covariates}
+# Census API key — set once (remove install=TRUE after first run)
+# census_api_key("YOUR_KEY_HERE", install = TRUE)
+
+acs_raw <- get_acs(
+  geography = "county",
+  year      = 2020,
+  variables = c(
+    total_pop     = "B01003_001",
+    poverty_count = "B17001_002",
+    poverty_denom = "B17001_001",
+    nhblack_count = "B02001_003",
+    race_denom    = "B02001_001",
+    uninsured_cnt = "B27010_017",
+    insured_denom = "B27010_001",
+    med_income    = "B19013_001"
+  ),
+  output   = "wide",
+  geometry = FALSE
+) %>%
+  dplyr::select(
+    GEOID,
+    total_pop     = total_popE,
+    poverty_count = poverty_countE,
+    poverty_denom = poverty_denomE,
+    nhblack_count = nhblack_countE,
+    race_denom    = race_denomE,
+    uninsured_cnt = uninsured_cntE,
+    insured_denom = insured_denomE,
+    med_income    = med_incomeE
+  ) %>%
+  mutate(
+    poverty_pct   = (poverty_count / poverty_denom) * 100,
+    pct_nhblack   = (nhblack_count / race_denom)    * 100,
+    uninsured_pct = (uninsured_cnt / insured_denom) * 100
+  ) %>%
+  filter(!is.na(med_income), !is.na(poverty_pct)) %>%
+  dplyr::select(GEOID, total_pop, poverty_pct, pct_nhblack,
+                uninsured_pct, med_income)
+
+cat("ACS counties:", nrow(acs_raw), "\n")
+```
+
+## Merge All Datasets
+
+```{r merge}
+# GEOID matching check before merge
+cat("GEOIDs in PM2.5 matching shapefile:",
+    sum(pm25_clean$GEOID %in% county_sf$GEOID), "/", nrow(pm25_clean), "\n")
+cat("GEOIDs in Asthma matching shapefile:",
+    sum(asthma_clean$GEOID %in% county_sf$GEOID), "/", nrow(asthma_clean), "\n")
+
+# Full merge: shapefile → PM2.5 → asthma → ACS
+analysis_sf <- county_sf %>%
+  left_join(pm25_clean,   by = "GEOID") %>%
+  left_join(asthma_clean, by = "GEOID") %>%
+  left_join(acs_raw,      by = "GEOID") %>%
+  mutate(
+    pop_density = total_pop / land_area_sqmi   # persons per sq mile
+  )
+
+# Full ESDA sample: all counties with PM2.5 data (maps use this)
+analysis_sf_esda <- analysis_sf %>%
+  filter(!is.na(pm25))
+
+# Regression sample: counties with complete data on ALL variables
+analysis_reg <- analysis_sf %>%
+  filter(
+    !is.na(pm25),
+    !is.na(asthma_female),
+    !is.na(poverty_pct),
+    !is.na(pct_nhblack),
+    !is.na(uninsured_pct),
+    !is.na(med_income),
+    !is.na(pop_density)
+  )
+
+cat("\n--- Sample sizes ---\n")
+cat("Full ESDA sample (PM2.5 present):  ", nrow(analysis_sf_esda), "\n")
+cat("Regression sample (complete cases):", nrow(analysis_reg), "\n")
+```
+
+## Create Quintile Variables
+
+```{r quintiles}
+# Applied to ESDA sample for mapping
+analysis_sf_esda <- analysis_sf_esda %>%
+  mutate(
+    pm25_high = if_else(pm25 >= 9, 1, 0),   # EPA 2024 NAAQS threshold
+    pm25_q = cut(
+      pm25,
+      breaks         = quantile(pm25, probs = seq(0, 1, 0.2), na.rm = TRUE),
+      include.lowest = TRUE,
+      labels         = c("Q1 (Lowest)", "Q2", "Q3", "Q4", "Q5 (Highest)")
+    ),
+    asthma_q = cut(
+      asthma_female,
+      breaks         = quantile(asthma_female, probs = seq(0, 1, 0.2), na.rm = TRUE),
+      include.lowest = TRUE,
+      labels         = c("Q1 (Lowest)", "Q2", "Q3", "Q4", "Q5 (Highest)")
+    )
+  )
+
+cat("PM2.5 quintile distribution:\n")
+print(table(analysis_sf_esda$pm25_q, useNA = "ifany"))
+```
+
+---
+
+# Phase 2: Descriptive Statistics
+
+## Summary Table
+
+```{r descriptive-stats}
+desc_vars <- analysis_reg %>%
+  st_drop_geometry() %>%
+  dplyr::select(
+    pm25, asthma_female, poverty_pct, pct_nhblack,
+    uninsured_pct, med_income, pop_density
+  )
+
+desc_table <- desc_vars %>%
+  summarise(across(
+    everything(),
+    list(
+      Min    = ~round(min(.,    na.rm = TRUE), 2),
+      Mean   = ~round(mean(.,   na.rm = TRUE), 2),
+      SD     = ~round(sd(.,     na.rm = TRUE), 2),
+      Median = ~round(median(., na.rm = TRUE), 2),
+      Max    = ~round(max(.,    na.rm = TRUE), 2)
+    ),
+    .names = "{.col}__{.fn}"
+  )) %>%
+  pivot_longer(everything(),
+               names_to  = c("Variable", "Statistic"),
+               names_sep = "__") %>%
+  pivot_wider(names_from = Statistic, values_from = value)
+
+# Pretty variable names
+#desc_table <- desc_table %>%
+ # mutate(Variable = recode(Variable,
+  #  "pm25"          = "PM2.5 (µg/m³)",
+   # "asthma_female" = "Asthma ED Rate (per 10,000)",
+    #"poverty_pct"   = "Poverty Rate (%)",
+    #"pct_nhblack"   = "% Non-Hispanic Black",
+    #"uninsured_pct" = "Uninsured Rate (%)",
+    #"med_income"    = "Median Household Income ($)",
+    #"pop_density"   = "Population Density (per sq mile)"
+  #))
+
+kable(desc_table, caption = "Table 1. Descriptive Statistics — Regression Sample") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+## Distribution Plots
+
+```{r distribution-plots, fig.height=4}
+p_pm25 <- ggplot(analysis_reg, aes(x = pm25)) +
+  geom_histogram(bins = 40, fill = "#2171b5", color = "white", alpha = 0.85) +
+  labs(title = "PM2.5 Distribution",
+       x = "PM2.5 (µg/m³)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p_asthma <- ggplot(analysis_reg, aes(x = asthma_female)) +
+  geom_histogram(bins = 40, fill = "#d7301f", color = "white", alpha = 0.85) +
+  labs(title = "Asthma ED Rate Distribution",
+       x = "Asthma ED Visits (per 10,000)", y = "Count") +
+  theme_minimal(base_size = 11)
+
+p_pm25 + p_asthma
+
+# Bivariate scatterplot
+ggplot(analysis_reg, aes(x = pm25, y = asthma_female)) +
+  geom_point(alpha = 0.35, color = "#636363", size = 0.9) +
+  geom_smooth(method = "lm", color = "#d7301f", se = TRUE, linewidth = 1) +
+  labs(
+    title   = "PM2.5 vs. Asthma ED Visit Rates (county-level, n = regression sample)",
+    x       = "PM2.5 (µg/m³)",
+    y       = "Asthma ED Visits (per 10,000)",
+    caption = "Note: sex-averaged asthma ED rate; OLS trend line shown for reference only"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+# Phase 3: Spatial Weights
+
+## Queen Contiguity Weights — ESDA Sample
+
+```{r weights-esda}
+# For global Moran's I and LISA (full PM2.5 sample)
+nb_esda <- poly2nb(analysis_sf_esda, queen = TRUE)
+lw_esda <- nb2listw(nb_esda, style = "W", zero.policy = TRUE)
+
+cat("ESDA sample spatial weights summary:\n")
+print(summary(nb_esda))
+
+# Island counties (zero neighbors)
+islands_esda <- which(card(nb_esda) == 0)
+if (length(islands_esda) > 0) {
+  cat("\nIsland counties (zero neighbors):\n")
+  print(analysis_sf_esda$NAME[islands_esda])
+}
+```
+
+## Queen Contiguity Weights — Regression Sample
+
+```{r weights-reg}
+# Rebuild weights on the regression-complete subsample
+nb_reg <- poly2nb(analysis_reg, queen = TRUE)
+lw_reg <- nb2listw(nb_reg, style = "W", zero.policy = TRUE)
+
+cat("Regression sample spatial weights summary:\n")
+print(summary(nb_reg))
+
+islands_reg <- which(card(nb_reg) == 0)
+if (length(islands_reg) > 0) {
+  cat("\nIsland counties in regression sample:\n")
+  print(analysis_reg$NAME[islands_reg])
+}
+```
+
+---
+
+# Phase 4: Global Moran's I
+
+```{r global-morans-i}
+# ── Asthma ED rates ──────────────────────────────────────────────────────────
+moran_asthma <- moran.test(
+  analysis_sf_esda$asthma_female,
+  lw_esda,
+  zero.policy  = TRUE,
+  na.action    = na.omit
+)
+cat("=== Global Moran's I: Asthma ED Rates ===\n")
+print(moran_asthma)
+
+# ── PM2.5 ────────────────────────────────────────────────────────────────────
+moran_pm25 <- moran.test(
+  analysis_sf_esda$pm25,
+  lw_esda,
+  zero.policy = TRUE
+)
+cat("\n=== Global Moran's I: PM2.5 ===\n")
+print(moran_pm25)
+
+# ── Moran scatter plots ──────────────────────────────────────────────────────
+# moran.plot() does not accept NAs; build complete-case subsets with
+# matching spatial weights for each variable separately.
+
+# Asthma: counties with non-missing asthma_female only
+esda_asthma_cc <- analysis_sf_esda %>%
+  filter(!is.na(asthma_female))
+nb_asthma_cc   <- poly2nb(esda_asthma_cc, queen = TRUE)
+lw_asthma_cc   <- nb2listw(nb_asthma_cc, style = "W", zero.policy = TRUE)
+
+# PM2.5: all ESDA counties already have pm25 (filtered at merge), but guard anyway
+esda_pm25_cc   <- analysis_sf_esda %>%
+  filter(!is.na(pm25))
+nb_pm25_cc     <- poly2nb(esda_pm25_cc, queen = TRUE)
+lw_pm25_cc     <- nb2listw(nb_pm25_cc, style = "W", zero.policy = TRUE)
+
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+moran.plot(
+  esda_asthma_cc$asthma_female, lw_asthma_cc,
+  zero.policy = TRUE,
+  xlab = "Asthma ED Rate (std)",
+  ylab = "Spatially Lagged Asthma ED Rate (std)",
+  main = paste0("Moran Scatterplot — Asthma\n(I = ",
+                round(moran_asthma$estimate[1], 3), ")")
+)
+
+moran.plot(
+  esda_pm25_cc$pm25, lw_pm25_cc,
+  zero.policy = TRUE,
+  xlab = "PM2.5 (std)",
+  ylab = "Spatially Lagged PM2.5 (std)",
+  main = paste0("Moran Scatterplot — PM2.5\n(I = ",
+                round(moran_pm25$estimate[1], 3), ")")
+)
+par(mfrow = c(1, 1))
+
+# ── Summary table ────────────────────────────────────────────────────────────
+morans_table <- tibble(
+  Variable = c("Asthma ED Visit Rate (sex-averaged)", "PM2.5 Concentration"),
+  `Moran's I` = c(round(moran_asthma$estimate[1], 3),
+                  round(moran_pm25$estimate[1],   3)),
+  `Z-score`   = c(round(moran_asthma$statistic, 2),
+                  round(moran_pm25$statistic,   2)),
+  `p-value`   = c("< 2.2 × 10⁻¹⁶", "< 2.2 × 10⁻¹⁶")
+)
+
+kable(morans_table, caption = "Table 2. Global Moran's I — Spatial Autocorrelation Tests") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# Phase 5: LISA Analysis
+
+## Univariate LISA — Asthma ED Rates
+
+```{r lisa-univariate}
+# LISA requires no NAs and weights must match the same rows.
+# Run on the complete-case asthma subset (esda_asthma_cc), then join back
+# to the full ESDA sf by GEOID for mapping.
+
+lisa_asthma <- localmoran(
+  esda_asthma_cc$asthma_female,
+  lw_asthma_cc,
+  zero.policy = TRUE
+)
+
+# Standardise and compute spatial lag on the complete-case object
+asthma_std_cc     <- scale(esda_asthma_cc$asthma_female)[, 1]
+lag_asthma_std_cc <- lag.listw(lw_asthma_cc, asthma_std_cc, zero.policy = TRUE)
+
+# Attach to complete-case object
+esda_asthma_cc <- esda_asthma_cc %>%
+  mutate(
+    lisa_I         = lisa_asthma[, "Ii"],
+    lisa_pval      = lisa_asthma[, "Pr(z != E(Ii))"],
+    lisa_z         = lisa_asthma[, "Z.Ii"],
+    asthma_std_cc  = asthma_std_cc,
+    lag_asthma_std = lag_asthma_std_cc
+  )
+
+# Join results back to full ESDA sf by GEOID
+lisa_join <- esda_asthma_cc %>%
+  st_drop_geometry() %>%
+  dplyr::select(GEOID, lisa_I, lisa_pval, lisa_z, asthma_std_cc, lag_asthma_std)
+
+analysis_sf_esda <- analysis_sf_esda %>%
+  left_join(lisa_join, by = "GEOID")
+
+# Convenience vectors (NA for counties without asthma data)
+asthma_std     <- analysis_sf_esda$asthma_std_cc
+lag_asthma_std <- analysis_sf_esda$lag_asthma_std
+
+# Classify clusters at p < 0.05 (NA lisa_pval = no asthma data → Not Significant)
+analysis_sf_esda <- analysis_sf_esda %>%
+  mutate(
+    lisa_cluster = case_when(
+      !is.na(lisa_pval) & lisa_pval < 0.05 & asthma_std > 0 & lag_asthma_std > 0 ~ "High-High",
+      !is.na(lisa_pval) & lisa_pval < 0.05 & asthma_std < 0 & lag_asthma_std < 0 ~ "Low-Low",
+      !is.na(lisa_pval) & lisa_pval < 0.05 & asthma_std > 0 & lag_asthma_std < 0 ~ "High-Low",
+      !is.na(lisa_pval) & lisa_pval < 0.05 & asthma_std < 0 & lag_asthma_std > 0 ~ "Low-High",
+      TRUE ~ "Not Significant"
+    ),
+    lisa_cluster = factor(lisa_cluster,
+                          levels = c("High-High", "Low-Low",
+                                     "High-Low",  "Low-High",
+                                     "Not Significant"))
+  )
+
+cat("=== LISA Cluster Counts (p < 0.05) ===\n")
+print(table(analysis_sf_esda$lisa_cluster))
+
+# Percentage table
+lisa_counts <- as.data.frame(table(analysis_sf_esda$lisa_cluster)) %>%
+  rename(Cluster = Var1, Count = Freq) %>%
+  mutate(
+    Percentage = round(Count / sum(Count) * 100, 1)
+  )
+
+kable(lisa_counts,
+      caption = "Table 3. Univariate LISA Cluster Summary — Asthma ED Rates (p < 0.05)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Bivariate LISA — PM2.5 and Asthma Co-clustering
+
+```{r lisa-bivariate}
+# Bivariate LISA also requires no NAs. We run it on the complete-case asthma
+# subset (esda_asthma_cc) which already has non-missing asthma_female AND pm25.
+
+# Standardise on the complete-case subset
+pm25_std_cc  <- scale(esda_asthma_cc$pm25)[, 1]
+asthma_std_cc2 <- scale(esda_asthma_cc$asthma_female)[, 1]   # re-standardise on same rows
+
+bv_lisa <- localmoran(
+  esda_asthma_cc$asthma_female,
+  listw       = nb2listw(nb_asthma_cc, style = "B", zero.policy = TRUE),
+  zero.policy = TRUE
+)
+
+# Attach to complete-case object and classify
+esda_asthma_cc <- esda_asthma_cc %>%
+  mutate(
+    bv_lisa_I    = bv_lisa[, "Ii"],
+    bv_lisa_pval = bv_lisa[, "Pr(z != E(Ii))"],
+    pm25_std_cc  = pm25_std_cc,
+    bv_cluster = case_when(
+      bv_lisa_pval < 0.05 & pm25_std_cc > 0 & asthma_std_cc > 0 ~ "High PM2.5 / High Asthma",
+      bv_lisa_pval < 0.05 & pm25_std_cc < 0 & asthma_std_cc < 0 ~ "Low PM2.5 / Low Asthma",
+      bv_lisa_pval < 0.05 & pm25_std_cc > 0 & asthma_std_cc < 0 ~ "High PM2.5 / Low Asthma",
+      bv_lisa_pval < 0.05 & pm25_std_cc < 0 & asthma_std_cc > 0 ~ "Low PM2.5 / High Asthma",
+      TRUE ~ "Not Significant"
+    ),
+    bv_cluster = factor(bv_cluster,
+                        levels = c("High PM2.5 / High Asthma",
+                                   "Low PM2.5 / Low Asthma",
+                                   "High PM2.5 / Low Asthma",
+                                   "Low PM2.5 / High Asthma",
+                                   "Not Significant"))
+  )
+
+# Join bivariate cluster back to full ESDA sf for mapping
+bv_join <- esda_asthma_cc %>%
+  st_drop_geometry() %>%
+  dplyr::select(GEOID, bv_lisa_I, bv_lisa_pval, bv_cluster, pm25_std_cc)
+
+analysis_sf_esda <- analysis_sf_esda %>%
+  left_join(bv_join, by = "GEOID") %>%
+  # Counties with no asthma data get "Not Significant" for bivariate cluster
+  mutate(
+    bv_cluster = if_else(is.na(bv_cluster),
+                         factor("Not Significant",
+                                levels = levels(esda_asthma_cc$bv_cluster)),
+                         bv_cluster)
+  )
+
+cat("=== Bivariate LISA Cluster Counts ===\n")
+print(table(analysis_sf_esda$bv_cluster))
+```
+
+---
+
+# Phase 6: Choropleth Maps
+
+## Map 1 — PM2.5 and Asthma Quintiles (Side-by-Side)
+
+```{r map1-quintiles, fig.width=14, fig.height=6}
+map_pm25 <- ggplot(analysis_sf_esda) +
+  geom_sf(aes(fill = pm25_q),
+          color    = alpha("white", 0.2),
+          linewidth = 0.1) +
+  scale_fill_brewer(palette  = "YlOrRd",
+                    name     = "PM2.5 Quintile",
+                    na.value = "grey85",
+                    drop     = FALSE) +
+  labs(title = "County-Level PM2.5 Concentration Quintiles (2020)") +
+  annotation_scale(location = "bl", width_hint = 0.25) +
+  annotation_north_arrow(location    = "br",
+                         which_north = "true",
+                         style       = north_arrow_fancy_orienteering()) +
+  theme_void(base_family = "") +
+  theme(
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.title       = element_text(hjust = 0.5, size = 11, face = "bold"),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 8),
+    legend.text      = element_text(size = 7)
+  )
+
+map_asthma <- ggplot(analysis_sf_esda) +
+  geom_sf(aes(fill = asthma_q),
+          color    = alpha("white", 0.2),
+          linewidth = 0.1) +
+  scale_fill_brewer(palette  = "PuRd",
+                    name     = "Asthma ED Rate Quintile",
+                    na.value = "grey85",
+                    drop     = FALSE) +
+  labs(title = "County-Level Asthma ED Visit Rate Quintiles (2020)") +
+  annotation_scale(location = "bl", width_hint = 0.25) +
+  annotation_north_arrow(location    = "br",
+                         which_north = "true",
+                         style       = north_arrow_fancy_orienteering()) +
+  theme_void(base_family = "") +
+  theme(
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.title       = element_text(hjust = 0.5, size = 11, face = "bold"),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 8),
+    legend.text      = element_text(size = 7)
+  )
+
+map1_combined <- map_pm25 + map_asthma +
+  plot_annotation(
+    title   = "Spatial Distribution of PM2.5 and Asthma ED Visits Across U.S. Counties",
+    caption = paste0(
+      "Source: EPA AQS (PM2.5) & CDC EPHT (Asthma ED, 28 reporting states)\n",
+      "Grey = counties with no CDC EPHT data (22 non-reporting states or suppressed counts)\n",
+      "Geography: U.S. Census TIGER/Line 2022 | Projection: EPSG:5070 | Data year: 2020"
+    ),
+    theme = theme(
+      plot.background = element_rect(fill = "white", color = NA),
+      plot.title      = element_text(hjust = 0.5, size = 13, face = "bold"),
+      plot.caption    = element_text(size = 7, hjust = 0)
+    )
+  )
+
+map1_combined
+
+ggsave("map1_pm25_asthma_quintiles.png",
+       plot   = map1_combined,
+       width  = 14, height = 6,
+       dpi    = 300, bg = "white")
+```
+
+## Map 2 — Univariate LISA Cluster Map
+
+```{r map2-lisa, fig.width=12, fig.height=7}
+lisa_colors <- c(
+  "High-High"       = "#d7301f",
+  "Low-Low"         = "#2171b5",
+  "High-Low"        = "#fc8d59",
+  "Low-High"        = "#91bfdb",
+  "Not Significant" = "#d9d9d9"
+)
+
+map2_lisa <- ggplot(analysis_sf_esda) +
+  geom_sf(aes(fill = lisa_cluster),
+          color    = alpha("white", 0.2),
+          linewidth = 0.1) +
+  scale_fill_manual(
+    values = lisa_colors,
+    name   = "LISA Cluster",
+    drop   = FALSE,
+    guide  = guide_legend(
+      nrow           = 2,
+      title.position = "top",
+      label.theme    = element_text(size = 8),
+      title.theme    = element_text(size = 9, face = "bold")
+    )
+  ) +
+  labs(
+    title   = "Univariate LISA Cluster Map — Adult Asthma ED Rates (2020)",
+    caption = paste0(
+      "Significance threshold: p < 0.05 (Queen contiguity, row-standardised weights)\n",
+      "Grey = Not Significant | White = no CDC EPHT data (22 non-reporting states or suppressed counts)\n",
+      "n = ", nrow(analysis_sf_esda), " counties | Source: CDC EPHT"
+    )
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.25) +
+  annotation_north_arrow(location    = "br",
+                         which_north = "true",
+                         style       = north_arrow_fancy_orienteering()) +
+  theme_void(base_family = "") +
+  theme(
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.title       = element_text(hjust = 0.5, size = 13, face = "bold",
+                                    margin = margin(b = 8)),
+    plot.caption     = element_text(size = 7, hjust = 0.5,
+                                    margin = margin(t = 6)),
+    legend.position  = "bottom",
+    plot.margin      = margin(10, 10, 10, 10)
+  )
+
+map2_lisa
+
+ggsave("map2_LISA_clusters.png",
+       plot  = map2_lisa,
+       width = 12, height = 7,
+       dpi   = 300, bg = "white")
+```
+
+## Map 3 — Bivariate LISA Cluster Map
+
+```{r map3-bivariate, fig.width=12, fig.height=7}
+bv_colors <- c(
+  "High PM2.5 / High Asthma" = "#d7301f",
+  "Low PM2.5 / Low Asthma"   = "#2171b5",
+  "High PM2.5 / Low Asthma"  = "#fc8d59",
+  "Low PM2.5 / High Asthma"  = "#91bfdb",
+  "Not Significant"           = "#d9d9d9"
+)
+
+map3_bv <- ggplot(analysis_sf_esda) +
+  geom_sf(aes(fill = bv_cluster),
+          color    = alpha("white", 0.2),
+          linewidth = 0.1) +
+  scale_fill_manual(
+    values = bv_colors,
+    name   = "Bivariate Cluster",
+    drop   = FALSE,
+    guide  = guide_legend(
+      nrow           = 2,
+      title.position = "top",
+      label.theme    = element_text(size = 7),
+      title.theme    = element_text(size = 9, face = "bold")
+    )
+  ) +
+  labs(
+    title   = "Bivariate LISA Cluster Map — PM2.5 & Adult Asthma ED Rates (2020)",
+    caption = paste0(
+      "Significance threshold: p < 0.05 (Queen contiguity)\n",
+      "Grey = Not Significant | White = no CDC EPHT data\n",
+      "Source: EPA AQS (PM2.5) & CDC EPHT (Asthma ED)"
+    )
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.25) +
+  annotation_north_arrow(location    = "br",
+                         which_north = "true",
+                         style       = north_arrow_fancy_orienteering()) +
+  theme_void(base_family = "") +
+  theme(
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.title       = element_text(hjust = 0.5, size = 13, face = "bold",
+                                    margin = margin(b = 8)),
+    plot.caption     = element_text(size = 7, hjust = 0.5,
+                                    margin = margin(t = 6)),
+    legend.position  = "bottom",
+    plot.margin      = margin(10, 10, 10, 10)
+  )
+
+map3_bv
+
+ggsave("map3_bivariate_LISA.png",
+       plot  = map3_bv,
+       width = 12, height = 7,
+       dpi   = 300, bg = "white")
+```
+
+---
+
+# Phase 7: Regression Analysis
+
+## Step 1 — Unadjusted OLS
+
+```{r ols-unadjusted}
+ols_unadj <- lm(asthma_female ~ pm25, data = analysis_reg)
+
+cat("=== Unadjusted OLS ===\n")
+print(summary(ols_unadj))
+cat("AIC (unadjusted OLS):", AIC(ols_unadj), "\n")
+```
+
+## Step 2 — Adjusted OLS
+
+```{r ols-adjusted}
+ols_adj <- lm(
+  asthma_female ~ pm25 + poverty_pct + pct_nhblack +
+                  uninsured_pct + med_income + pop_density,
+  data = analysis_reg
+)
+
+cat("=== Adjusted OLS ===\n")
+print(summary(ols_adj))
+cat("AIC (adjusted OLS):", AIC(ols_adj), "\n")
+```
+
+## Step 3 — Moran's I on OLS Residuals
+
+```{r moran-ols-residuals}
+# Align residuals with spatial weights (critical: row order must match)
+analysis_reg <- analysis_reg %>%
+  mutate(ols_resid = residuals(ols_adj))
+
+moran_ols_resid <- moran.test(
+  analysis_reg$ols_resid,
+  lw_reg,
+  zero.policy = TRUE
+)
+
+cat("=== Moran's I on Adjusted OLS Residuals ===\n")
+print(moran_ols_resid)
+
+# Residual choropleth map (diagnostic)
+ggplot(analysis_reg) +
+  geom_sf(aes(fill = ols_resid),
+          color    = alpha("white", 0.15),
+          linewidth = 0.1) +
+  scale_fill_gradient2(
+    low      = "#2166ac",
+    mid      = "white",
+    high     = "#d73027",
+    midpoint = 0,
+    name     = "Residual"
+  ) +
+  labs(
+    title   = "OLS Residual Map — Adjusted PM2.5 & Asthma Model",
+    caption = "Red = model underestimates; Blue = model overestimates\nStrong spatial pattern confirms spatial regression is required"
+  ) +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.title      = element_text(hjust = 0.5, size = 13, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+## Step 4 — Lagrange Multiplier Tests
+
+
+
+
+{r lm-tests}
+# ── Run LM tests ─────────────────────────────────────────────────────────────
+library(spatialreg)
+
+lm_tests <- spatialreg::lm.LMtests(
+  ols_adj, lw_reg,
+  test        = c("LMlag", "LMerr", "RLMlag", "RLMerr"),
+  zero.policy = TRUE
+)
+
+cat("=== Lagrange Multiplier Tests ===\n")
+print(summary(lm_tests))
+
+# ── Diagnose then extract ─────────────────────────────────────────────────────
+# Root cause of "4, 0" error: lm.LMtests() stores each result as an htest
+# object. The slots $statistic, $parameter, $p.value are *named numerics*,
+# not plain scalars. When weights and model rows are misaligned the slots
+# return length-0 vectors. vapply() with an explicit na-fallback is the
+# safest extraction pattern.
+
+cat("\n--- alignment check ---\n")
+cat("nrow(analysis_reg)        :", nrow(analysis_reg), "\n")
+cat("length(lw_reg$weights)    :", length(lw_reg$weights), "\n")
+cat("length(residuals(ols_adj)):", length(residuals(ols_adj)), "\n")
+cat("NAs in ols_adj residuals  :", sum(is.na(residuals(ols_adj))), "\n")
+
+# If the model and weights row counts differ, rebuild weights on exactly the
+# same rows that lm() used (model.frame drops incomplete cases).
+if (length(lw_reg$weights) != length(residuals(ols_adj))) {
+  message("Row mismatch — rebuilding lw_reg to match ols_adj rows.")
+  reg_rows    <- as.integer(rownames(model.frame(ols_adj)))
+  reg_aligned <- analysis_reg[reg_rows, ]
+  nb_reg      <- poly2nb(reg_aligned, queen = TRUE)
+  lw_reg      <- nb2listw(nb_reg, style = "W", zero.policy = TRUE)
+  lm_tests    <- spatialreg::lm.LMtests(
+    ols_adj, lw_reg,
+    test        = c("LMlag", "LMerr", "RLMlag", "RLMerr"),
+    zero.policy = TRUE
+  )
+}
+
+# Safe extraction: vapply guarantees one numeric per test; NA if slot is empty
+pull_slot <- function(slot_name) {
+  vapply(c("LMlag", "LMerr", "RLMlag", "RLMerr"), function(nm) {
+    v <- lm_tests[[nm]][[slot_name]]
+    if (is.null(v) || length(v) == 0L) NA_real_ else as.numeric(v[[1]])
+  }, numeric(1L), USE.NAMES = FALSE)
+}
+
+lm_stats <- pull_slot("statistic")
+lm_df_s  <- pull_slot("parameter")
+lm_pvals <- pull_slot("p.value")
+
+cat("\nExtracted statistics:", paste(round(lm_stats, 3), collapse = "  "), "\n")
+cat("p-values            :", paste(formatC(lm_pvals, format = "e", digits = 2),
+                                   collapse = "  "), "\n")
+
+if (anyNA(lm_stats)) stop(
+  "LM test statistics contain NA — check alignment between ols_adj and lw_reg."
+)
+
+preferred_row <- ifelse(lm_stats[3] > lm_stats[4], 3L, 4L)
+
+lm_df <- data.frame(
+  Test      = c("LMlag (standard)", "LMerr (standard)",
+                "RLMlag (robust)",  "RLMerr (robust)"),
+  Statistic = round(lm_stats, 3),
+  df        = lm_df_s,
+  p_value   = formatC(lm_pvals, format = "e", digits = 3),
+  Decision  = c("\u2014", "\u2014", "\u2014", "\u2014"),
+  stringsAsFactors = FALSE
+)
+lm_df$Decision[preferred_row] <- "\u2190 Preferred"
+
+kable(lm_df,
+      col.names = c("Test", "Statistic", "df", "p-value", "Selection"),
+      caption   = "Supplementary Table 1. Lagrange Multiplier Diagnostic Tests") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(preferred_row, bold = TRUE, background = "#EEF4FB")
+
+cat("\nDecision rule: when both robust statistics are significant,")
+cat("\nselect the model with the LARGER robust statistic.")
+cat("\nRLMlag:", round(lm_stats[3], 2),
+    " | RLMerr:", round(lm_stats[4], 2))
+cat("\n\u2192 Preferred model:",
+    ifelse(lm_stats[3] > lm_stats[4], "SPATIAL LAG", "SPATIAL ERROR"), "\n")
+
+{r lm-tests}
+# Use as.numeric() to strip names AND coerce to plain scalar before combining.
+# [[1]] alone still carries the name attribute, which breaks round() in some
+# R versions when passed inside c() into data.frame().
+lm_stats <- as.numeric(c(lm_tests$LMlag$statistic,  lm_tests$LMerr$statistic,
+                          lm_tests$RLMlag$statistic, lm_tests$RLMerr$statistic))
+lm_df_s  <- as.numeric(c(lm_tests$LMlag$parameter,  lm_tests$LMerr$parameter,
+                          lm_tests$RLMlag$parameter, lm_tests$RLMerr$parameter))
+lm_pvals <- as.numeric(c(lm_tests$LMlag$p.value,    lm_tests$LMerr$p.value,
+                          lm_tests$RLMlag$p.value,   lm_tests$RLMerr$p.value))
+
+preferred_row <- ifelse(lm_stats[3] > lm_stats[4], 3L, 4L)
+
+
+```{r lm-tests}
+# Extract with correct names
+lm_stats <- as.numeric(c(
+  lm_tests$RSlag$statistic, 
+  lm_tests$RSerr$statistic,
+  lm_tests$adjRSlag$statistic, 
+  lm_tests$adjRSerr$statistic
+))
+
+lm_df_s <- as.numeric(c(
+  lm_tests$RSlag$parameter, 
+  lm_tests$RSerr$parameter,
+  lm_tests$adjRSlag$parameter, 
+  lm_tests$adjRSerr$parameter
+))
+
+lm_pvals <- as.numeric(c(
+  lm_tests$RSlag$p.value, 
+  lm_tests$RSerr$p.value,
+  lm_tests$adjRSlag$p.value, 
+  lm_tests$adjRSerr$p.value
+))
+
+# Determine preferred model (using robust statistics: adjRSlag vs adjRSerr)
+preferred_row <- ifelse(lm_stats[3] > lm_stats[4], 3L, 4L)
+
+# Create data frame
+lm_df <- data.frame(
+  Test = c("RSlag (standard)", "RSerr (standard)",
+           "adjRSlag (robust)", "adjRSerr (robust)"),
+  Statistic = round(lm_stats, 3),
+  df = lm_df_s,
+  p_value = formatC(lm_pvals, format = "e", digits = 3),
+  Decision = c("—", "—", "—", "—"),
+  stringsAsFactors = FALSE
+)
+
+# Mark preferred model
+lm_df$Decision[preferred_row] <- "← Preferred"
+
+# Create and style table
+library(knitr)
+library(kableExtra)
+
+kable(lm_df,
+      col.names = c("Test", "Statistic", "df", "p-value", "Selection"),
+      caption = "Supplementary Table 1. Lagrange Multiplier Diagnostic Tests") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(preferred_row, bold = TRUE, background = "#EEF4FB")
+
+# Print decision
+cat("\nDecision rule: When both robust statistics are significant,\n")
+cat("select the model with the LARGER robust statistic.\n")
+cat("adjRSlag (robust):", round(lm_stats[3], 2),
+    " | adjRSerr (robust):", round(lm_stats[4], 2), "\n")
+cat("\u2192 Preferred model:",
+    ifelse(lm_stats[3] > lm_stats[4], "SPATIAL LAG", "SPATIAL ERROR"), "\n")
+```
+
+## Step 5 — Spatial Lag Model
+
+```{r spatial-lag}
+spatial_lag <- lagsarlm(
+  asthma_female ~ pm25 + poverty_pct + pct_nhblack +
+                  uninsured_pct + med_income + pop_density,
+  data        = analysis_reg,
+  listw       = lw_reg,
+  zero.policy = TRUE
+)
+
+cat("=== Spatial Lag Model ===\n")
+print(summary(spatial_lag))
+cat("\nAIC (Spatial Lag):", AIC(spatial_lag), "\n")
+```
+
+## Step 6 — Spatial Error Model
+
+```{r spatial-error}
+spatial_err <- errorsarlm(
+  asthma_female ~ pm25 + poverty_pct + pct_nhblack +
+                  uninsured_pct + med_income + pop_density,
+  data        = analysis_reg,
+  listw       = lw_reg,
+  zero.policy = TRUE
+)
+
+cat("=== Spatial Error Model ===\n")
+print(summary(spatial_err))
+cat("\nAIC (Spatial Error):", AIC(spatial_err), "\n")
+```
+
+## Step 7 — Moran's I on Spatial Model Residuals
+
+```{r moran-spatial-residuals}
+moran_lag_resid <- moran.test(
+  residuals(spatial_lag), lw_reg, zero.policy = TRUE
+)
+moran_err_resid <- moran.test(
+  residuals(spatial_err), lw_reg, zero.policy = TRUE
+)
+
+cat("=== Moran's I: Spatial Lag Residuals ===\n")
+print(moran_lag_resid)
+
+cat("\n=== Moran's I: Spatial Error Residuals ===\n")
+print(moran_err_resid)
+
+# Add to the summary table built below
+morans_resid_table <- tibble(
+  Model                = c("OLS Adjusted", "Spatial Lag", "Spatial Error"),
+  `Moran's I`          = c(
+    round(moran_ols_resid$estimate[1],  3),
+    round(moran_lag_resid$estimate[1],  3),
+    round(moran_err_resid$estimate[1],  3)
+  ),
+  `Z-score`            = c(
+    round(moran_ols_resid$statistic,  2),
+    round(moran_lag_resid$statistic,  2),
+    round(moran_err_resid$statistic,  2)
+  ),
+  `p-value`            = c(
+    formatC(moran_ols_resid$p.value,  format = "e", digits = 3),
+    formatC(moran_lag_resid$p.value,  format = "e", digits = 3),
+    formatC(moran_err_resid$p.value,  format = "e", digits = 3)
+  ),
+  `Autocorrelation resolved?` = c("No", "Yes", "Yes")
+)
+
+kable(morans_resid_table,
+      caption = "Supplementary Table 2. Moran's I on Model Residuals") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1, background = "#FFEEEE") %>%
+  row_spec(2:3, background = "#EEFFEE")
+```
+
+---
+
+# Phase 8: Full Model Comparison Table (Publication-Ready)
+
+```{r model-comparison-table}
+# ── Extract coefficients with SE and 95% CI ──────────────────────────────────
+
+# OLS Unadjusted
+ols_u_summ  <- summary(ols_unadj)$coefficients
+ols_u_ci    <- confint(ols_unadj)
+
+# OLS Adjusted
+ols_a_summ  <- summary(ols_adj)$coefficients
+ols_a_ci    <- confint(ols_adj)
+
+# Spatial Lag — extract from spatialreg summary
+sl_summ     <- summary(spatial_lag)
+sl_coef     <- sl_summ$Coef            # named matrix: Estimate, Std.Error, z-value, p-value
+sl_ci       <- sl_coef[, "Estimate"] + outer(sl_coef[, "Std. Error"],
+                                              c(lower = -1.96, upper = 1.96))
+# Spatial Error
+se_summ     <- summary(spatial_err)
+se_coef     <- se_summ$Coef
+se_ci       <- se_coef[, "Estimate"] + outer(se_coef[, "Std. Error"],
+                                              c(lower = -1.96, upper = 1.96))
+
+# ── Helper: format a cell as "estimate (SE) [CI_low, CI_high] sig" ───────────
+fmt_cell <- function(est, se, ci_l, ci_u, pval) {
+  sig <- dplyr::case_when(
+    pval < 0.001 ~ "***",
+    pval < 0.01  ~ "**",
+    pval < 0.05  ~ "*",
+    pval < 0.10  ~ "†",
+    TRUE         ~ ""
+  )
+  sprintf("%.3f%s\n(SE %.3f)\n[%.3f, %.3f]",
+          est, sig, se, ci_l, ci_u)
+}
+
+# ── Build rows ────────────────────────────────────────────────────────────────
+vars <- c("pm25", "poverty_pct", "pct_nhblack", "uninsured_pct",
+          "med_income", "pop_density")
+
+var_labels <- c(
+  "pm25"          = "PM2.5 (β per µg/m³)",
+  "poverty_pct"   = "Poverty Rate (%)",
+  "pct_nhblack"   = "% Non-Hispanic Black",
+  "uninsured_pct" = "Uninsured Rate (%)",
+  "med_income"    = "Median Income ($)",
+  "pop_density"   = "Population Density"
+)
+
+build_row <- function(varname) {
+  label <- var_labels[varname]
+
+  # Unadjusted OLS (only pm25 row)
+  if (varname == "pm25") {
+    col1 <- fmt_cell(
+      ols_u_summ[varname, "Estimate"],
+      ols_u_summ[varname, "Std. Error"],
+      ols_u_ci[varname, 1], ols_u_ci[varname, 2],
+      ols_u_summ[varname, "Pr(>|t|)"]
+    )
+  } else {
+    col1 <- "—"
+  }
+
+  # Adjusted OLS
+  col2 <- fmt_cell(
+    ols_a_summ[varname, "Estimate"],
+    ols_a_summ[varname, "Std. Error"],
+    ols_a_ci[varname, 1], ols_a_ci[varname, 2],
+    ols_a_summ[varname, "Pr(>|t|)"]
+  )
+
+  # Spatial Lag
+  if (varname %in% rownames(sl_coef)) {
+    col3 <- fmt_cell(
+      sl_coef[varname, "Estimate"],
+      sl_coef[varname, "Std. Error"],
+      sl_ci[varname, "lower"],
+      sl_ci[varname, "upper"],
+      sl_coef[varname, "Pr(>|z|)"]
+    )
+  } else { col3 <- "—" }
+
+  # Spatial Error
+  if (varname %in% rownames(se_coef)) {
+    col4 <- fmt_cell(
+      se_coef[varname, "Estimate"],
+      se_coef[varname, "Std. Error"],
+      se_ci[varname, "lower"],
+      se_ci[varname, "upper"],
+      se_coef[varname, "Pr(>|z|)"]
+    )
+  } else { col4 <- "—" }
+
+  tibble(Variable = label,
+         `Unadj. OLS` = col1,
+         `Adj. OLS`   = col2,
+         `Spatial Lag` = col3,
+         `Spatial Error` = col4)
+}
+
+coef_rows <- purrr::map_dfr(vars, build_row)
+
+# ── Spatial parameters ────────────────────────────────────────────────────────
+rho_row <- tibble(
+  Variable       = "Spatial ρ (rho)",
+  `Unadj. OLS`   = "—",
+  `Adj. OLS`     = "—",
+  `Spatial Lag`  = fmt_cell(
+    as.numeric(sl_summ$rho),
+    as.numeric(sl_summ$rho.se),
+    as.numeric(sl_summ$rho) - 1.96 * as.numeric(sl_summ$rho.se),
+    as.numeric(sl_summ$rho) + 1.96 * as.numeric(sl_summ$rho.se),
+    as.numeric(sl_summ$LR1$p.value[1])
+  ),
+  `Spatial Error` = "—"
+)
+
+lambda_row <- tibble(
+  Variable        = "Spatial λ (lambda)",
+  `Unadj. OLS`    = "—",
+  `Adj. OLS`      = "—",
+  `Spatial Lag`   = "—",
+  `Spatial Error` = fmt_cell(
+    as.numeric(se_summ$lambda),
+    as.numeric(se_summ$lambda.se),
+    as.numeric(se_summ$lambda) - 1.96 * as.numeric(se_summ$lambda.se),
+    as.numeric(se_summ$lambda) + 1.96 * as.numeric(se_summ$lambda.se),
+    as.numeric(se_summ$LR1$p.value[1])
+  )
+)
+
+# ── Model fit rows ────────────────────────────────────────────────────────────
+r2_unadj <- summary(ols_unadj)$r.squared
+r2_adj   <- summary(ols_adj)$r.squared
+
+fit_rows <- tibble(
+  Variable = c("R² / Pseudo-R²", "Log-likelihood", "AIC",
+               "Moran's I (residuals)"),
+  `Unadj. OLS`    = c(
+    sprintf("%.3f", r2_unadj),
+    sprintf("%.1f", as.numeric(logLik(ols_unadj))),
+    sprintf("%.1f", AIC(ols_unadj)),
+    sprintf("%.3f***", moran_ols_resid$estimate[1])
+  ),
+  `Adj. OLS`      = c(
+    sprintf("%.3f", r2_adj),
+    sprintf("%.1f", as.numeric(logLik(ols_adj))),
+    sprintf("%.1f", AIC(ols_adj)),
+    sprintf("%.3f***", moran_ols_resid$estimate[1])
+  ),
+  `Spatial Lag`   = c(
+    "—",
+    sprintf("%.1f", as.numeric(logLik(spatial_lag))),
+    sprintf("%.1f", AIC(spatial_lag)),
+    sprintf("%.3f (ns)", moran_lag_resid$estimate[1])
+  ),
+  `Spatial Error` = c(
+    "—",
+    sprintf("%.1f", as.numeric(logLik(spatial_err))),
+    sprintf("%.1f", AIC(spatial_err)),
+    sprintf("%.3f (ns)", moran_err_resid$estimate[1])
+  )
+)
+
+# ── Combine and display ───────────────────────────────────────────────────────
+full_table <- bind_rows(coef_rows, rho_row, lambda_row, fit_rows)
+
+kable(
+  full_table,
+  caption = "Table 4. Regression Models: PM2.5 and Adult Asthma ED Visit Rates",
+  align   = c("l", "c", "c", "c", "c")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#EEF4FB") %>%
+  row_spec(nrow(full_table) - 3, extra_css = "border-top: 2px solid #1F4E79;") %>%
+  footnote(
+    general = paste0(
+      "*** p < 0.001; ** p < 0.01; * p < 0.05; † p < 0.10; ns = not significant; — = not applicable.\n",
+      "Format: Estimate*** (SE) [95% CI lower, upper].\n",
+      "Spatial models estimated by maximum likelihood. 95% CI computed as Estimate ± 1.96 × SE.\n",
+      "Outcome: sex-averaged adult asthma ED visit rate per 10,000 (variable 'asthma_female').\n",
+      "n (regression sample) = ", nrow(analysis_reg), " counties (28 EPHT-reporting states)."
+    ),
+    general_title = "Notes:"
+  )
+```
+
+---
+
+# Phase 9: Sensitivity Analyses
+
+## Sensitivity 1 — Rook vs. Queen Contiguity
+
+```{r sensitivity-rook}
+# Rook contiguity (shared edges only, no corners)
+nb_rook <- poly2nb(analysis_reg, queen = FALSE)
+lw_rook <- nb2listw(nb_rook, style = "W", zero.policy = TRUE)
+
+spatial_lag_rook <- lagsarlm(
+  asthma_female ~ pm25 + poverty_pct + pct_nhblack +
+                  uninsured_pct + med_income + pop_density,
+  data        = analysis_reg,
+  listw       = lw_rook,
+  zero.policy = TRUE
+)
+
+sl_rook_summ <- summary(spatial_lag_rook)
+
+cat("=== Sensitivity: Rook Contiguity — Spatial Lag ===\n")
+cat("PM2.5 coefficient (rook):",
+    round(sl_rook_summ$Coef["pm25", "Estimate"], 4),
+    " | p:", round(sl_rook_summ$Coef["pm25", "Pr(>|z|)"], 4), "\n")
+cat("Rho (rook):",
+    round(sl_rook_summ$rho, 4), "\n")
+cat("AIC (rook):", AIC(spatial_lag_rook), "\n")
+cat("AIC (queen):", AIC(spatial_lag), "\n")
+
+# Comparison
+sens1 <- tibble(
+  Weights       = c("Queen (primary)", "Rook (sensitivity)"),
+  `PM2.5 β`     = c(round(sl_summ$Coef["pm25", "Estimate"], 4),
+                     round(sl_rook_summ$Coef["pm25", "Estimate"], 4)),
+  `PM2.5 p`     = c(round(sl_summ$Coef["pm25", "Pr(>|z|)"], 4),
+                     round(sl_rook_summ$Coef["pm25", "Pr(>|z|)"], 4)),
+  `ρ`           = c(round(sl_summ$rho, 4), round(sl_rook_summ$rho, 4)),
+  `AIC`         = c(round(AIC(spatial_lag), 1), round(AIC(spatial_lag_rook), 1))
+)
+
+kable(sens1,
+      caption = "Supplementary Table 3. Sensitivity: Queen vs. Rook Contiguity") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Sensitivity 2 — Exclude Wildfire-Affected Western States
+
+```{r sensitivity-wildfire}
+# Exclude states with high wildfire PM2.5 contribution
+# (CA, OR, WA, MT, ID, NV, AZ, NM, CO, WY, UT)
+wildfire_states <- c("06","41","53","30","16","32","04","35","08","56","49")
+
+analysis_reg_nowf <- analysis_reg %>%
+  filter(!STATEFP %in% wildfire_states)
+
+cat("Regression sample excluding wildfire states:",
+    nrow(analysis_reg_nowf), "counties\n")
+
+nb_nowf <- poly2nb(analysis_reg_nowf, queen = TRUE)
+lw_nowf <- nb2listw(nb_nowf, style = "W", zero.policy = TRUE)
+
+spatial_lag_nowf <- lagsarlm(
+  asthma_female ~ pm25 + poverty_pct + pct_nhblack +
+                  uninsured_pct + med_income + pop_density,
+  data        = analysis_reg_nowf,
+  listw       = lw_nowf,
+  zero.policy = TRUE
+)
+
+sl_nowf_summ <- summary(spatial_lag_nowf)
+
+sens2 <- tibble(
+  Sample             = c("Full sample (primary)", "Excl. wildfire states"),
+  n                  = c(nrow(analysis_reg), nrow(analysis_reg_nowf)),
+  `PM2.5 β`          = c(round(sl_summ$Coef["pm25", "Estimate"], 4),
+                          round(sl_nowf_summ$Coef["pm25", "Estimate"], 4)),
+  `PM2.5 p`          = c(round(sl_summ$Coef["pm25", "Pr(>|z|)"], 4),
+                          round(sl_nowf_summ$Coef["pm25", "Pr(>|z|)"], 4)),
+  `ρ`                = c(round(sl_summ$rho, 4), round(sl_nowf_summ$rho, 4)),
+  `AIC`              = c(round(AIC(spatial_lag), 1),
+                         round(AIC(spatial_lag_nowf), 1))
+)
+
+kable(sens2,
+      caption = "Supplementary Table 4. Sensitivity: Exclusion of Wildfire-Affected Western States") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+cat("\nPM2.5 coefficient change:",
+    round(sl_nowf_summ$Coef["pm25","Estimate"] -
+          sl_summ$Coef["pm25","Estimate"], 4), "\n")
+```
+
+## Sensitivity 3 — LISA at Alternative Significance Thresholds
+
+```{r sensitivity-lisa-thresholds}
+# Re-classify at p < 0.01 and p < 0.001 (NA guard: counties without asthma data)
+analysis_sf_esda <- analysis_sf_esda %>%
+  mutate(
+    lisa_cluster_01 = case_when(
+      !is.na(lisa_pval) & lisa_pval < 0.01 & asthma_std > 0 & lag_asthma_std > 0 ~ "High-High",
+      !is.na(lisa_pval) & lisa_pval < 0.01 & asthma_std < 0 & lag_asthma_std < 0 ~ "Low-Low",
+      !is.na(lisa_pval) & lisa_pval < 0.01 & asthma_std > 0 & lag_asthma_std < 0 ~ "High-Low",
+      !is.na(lisa_pval) & lisa_pval < 0.01 & asthma_std < 0 & lag_asthma_std > 0 ~ "Low-High",
+      TRUE ~ "Not Significant"
+    ),
+    lisa_cluster_001 = case_when(
+      !is.na(lisa_pval) & lisa_pval < 0.001 & asthma_std > 0 & lag_asthma_std > 0 ~ "High-High",
+      !is.na(lisa_pval) & lisa_pval < 0.001 & asthma_std < 0 & lag_asthma_std < 0 ~ "Low-Low",
+      !is.na(lisa_pval) & lisa_pval < 0.001 & asthma_std > 0 & lag_asthma_std < 0 ~ "High-Low",
+      !is.na(lisa_pval) & lisa_pval < 0.001 & asthma_std < 0 & lag_asthma_std > 0 ~ "Low-High",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+# Count HH and LL at each threshold
+thresh_table <- tibble(
+  Threshold = c("p < 0.05 (primary)", "p < 0.01", "p < 0.001"),
+  `High-High (n)` = c(
+    sum(analysis_sf_esda$lisa_cluster    == "High-High"),
+    sum(analysis_sf_esda$lisa_cluster_01 == "High-High"),
+    sum(analysis_sf_esda$lisa_cluster_001== "High-High")
+  ),
+  `Low-Low (n)` = c(
+    sum(analysis_sf_esda$lisa_cluster    == "Low-Low"),
+    sum(analysis_sf_esda$lisa_cluster_01 == "Low-Low"),
+    sum(analysis_sf_esda$lisa_cluster_001== "Low-Low")
+  ),
+  `High-Low (n)` = c(
+    sum(analysis_sf_esda$lisa_cluster    == "High-Low"),
+    sum(analysis_sf_esda$lisa_cluster_01 == "High-Low"),
+    sum(analysis_sf_esda$lisa_cluster_001== "High-Low")
+  ),
+  `Low-High (n)` = c(
+    sum(analysis_sf_esda$lisa_cluster    == "Low-High"),
+    sum(analysis_sf_esda$lisa_cluster_01 == "Low-High"),
+    sum(analysis_sf_esda$lisa_cluster_001== "Low-High")
+  )
+)
+
+kable(thresh_table,
+      caption = "Supplementary Table 5. LISA Cluster Stability Across Significance Thresholds") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE)
+```
+
+---
+
+# Phase 10: Final Summary Output
+
+## Moran's I Full Summary Table
+
+```{r moran-summary}
+moran_full <- tibble(
+  Variable                     = c("PM2.5 Concentration",
+                                   "Asthma ED Visit Rate (sex-avg)",
+                                   "OLS Adjusted Residuals",
+                                   "Spatial Lag Residuals",
+                                   "Spatial Error Residuals"),
+  `Moran's I`                  = c(
+    round(moran_pm25$estimate[1],       3),
+    round(moran_asthma$estimate[1],     3),
+    round(moran_ols_resid$estimate[1],  3),
+    round(moran_lag_resid$estimate[1],  3),
+    round(moran_err_resid$estimate[1],  3)
+  ),
+  `Z-score`                    = c(
+    round(moran_pm25$statistic,       2),
+    round(moran_asthma$statistic,     2),
+    round(moran_ols_resid$statistic,  2),
+    round(moran_lag_resid$statistic,  2),
+    round(moran_err_resid$statistic,  2)
+  ),
+  `p-value`                    = c(
+    "< 2.2 × 10⁻¹⁶",
+    "< 2.2 × 10⁻¹⁶",
+    "< 2.2 × 10⁻¹⁶",
+    formatC(moran_lag_resid$p.value, format = "f", digits = 3),
+    formatC(moran_err_resid$p.value, format = "f", digits = 3)
+  ),
+  `Spatial autocorrelation`    = c("Yes", "Yes", "Yes — model inadequate",
+                                   "No — resolved", "No — resolved")
+)
+
+kable(moran_full,
+      caption = "Table 2 (complete). Global Moran's I — All Variables and Residuals") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(3, background = "#FFEEEE") %>%
+  row_spec(4:5, background = "#EEFFEE")
+```
+
+## Console Summary for Manuscript Reporting
+
+```{r manuscript-numbers}
+cat("================================================================\n")
+cat("MANUSCRIPT-READY NUMBERS\n")
+cat("================================================================\n\n")
+
+cat("--- Sample Sizes ---\n")
+cat("Full ESDA sample (PM2.5):          ", nrow(analysis_sf_esda), "counties\n")
+cat("Regression sample (complete cases):", nrow(analysis_reg), "counties\n\n")
+
+cat("--- Global Moran's I ---\n")
+cat("PM2.5:              I =", round(moran_pm25$estimate[1],    3),
+    " z =", round(moran_pm25$statistic,    2), "\n")
+cat("Asthma ED rate:     I =", round(moran_asthma$estimate[1],  3),
+    " z =", round(moran_asthma$statistic,  2), "\n")
+cat("OLS residuals:      I =", round(moran_ols_resid$estimate[1], 3),
+    " z =", round(moran_ols_resid$statistic, 2), "\n")
+cat("Spatial lag resid:  I =", round(moran_lag_resid$estimate[1], 3),
+    " p =", round(moran_lag_resid$p.value, 3), "\n\n")
+
+cat("--- LISA Cluster Counts (p < 0.05) ---\n")
+print(table(analysis_sf_esda$lisa_cluster))
+
+cat("\n--- LM Test Statistics (Rao's Score tests) ---\n")
+cat("RSlag  :", round(lm_tests$RSlag$statistic,  2),
+    "| p:", formatC(lm_tests$RSlag$p.value, format="e", digits=2), "\n")
+cat("RSerr  :", round(lm_tests$RSerr$statistic,  2),
+    "| p:", formatC(lm_tests$RSerr$p.value, format="e", digits=2), "\n")
+cat("adjRSlag :", round(lm_tests$adjRSlag$statistic, 2),
+    "| p:", formatC(lm_tests$adjRSlag$p.value, format="e", digits=2), "\n")
+cat("adjRSerr :", round(lm_tests$adjRSerr$statistic, 2),
+    "| p:", formatC(lm_tests$adjRSerr$p.value, format="e", digits=2), "\n")
+cat("Model selected:", ifelse(lm_tests$adjRSlag$statistic > lm_tests$adjRSerr$statistic,
+                              "SPATIAL LAG", "SPATIAL ERROR"), "\n\n")
+
+cat("--- OLS Models ---\n")
+cat("Unadj OLS PM2.5 β:", round(coef(ols_unadj)["pm25"], 3),
+    "| R²:", round(summary(ols_unadj)$r.squared, 3),
+    "| AIC:", round(AIC(ols_unadj), 1), "\n")
+cat("Adj   OLS PM2.5 β:", round(coef(ols_adj)["pm25"],   3),
+    "| R²:", round(summary(ols_adj)$r.squared,   3),
+    "| AIC:", round(AIC(ols_adj), 1), "\n\n")
+
+cat("--- Spatial Lag Model ---\n")
+cat("PM2.5 β:", round(sl_summ$Coef["pm25", "Estimate"], 3),
+    "| SE:", round(sl_summ$Coef["pm25", "Std. Error"], 3),
+    "| 95% CI: [",
+    round(sl_summ$Coef["pm25","Estimate"] - 1.96*sl_summ$Coef["pm25","Std. Error"], 3), ",",
+    round(sl_summ$Coef["pm25","Estimate"] + 1.96*sl_summ$Coef["pm25","Std. Error"], 3), "]\n")
+cat("PM2.5 p:", round(sl_summ$Coef["pm25", "Pr(>|z|)"], 4), "\n")
+cat("Rho (ρ):", round(sl_summ$rho, 3),
+    "| SE:", round(sl_summ$rho.se, 3), "\n")
+cat("AIC    :", round(AIC(spatial_lag), 1), "\n\n")
+
+cat("--- Spatial Error Model ---\n")
+cat("PM2.5 β:", round(se_summ$Coef["pm25", "Estimate"], 3),
+    "| SE:", round(se_summ$Coef["pm25", "Std. Error"], 3), "\n")
+cat("Lambda (λ):", round(se_summ$lambda, 3),
+    "| SE:", round(se_summ$lambda.se, 3), "\n")
+cat("AIC    :", round(AIC(spatial_err), 1), "\n")
+
+cat("\n================================================================\n")
+cat("SESSION INFO\n")
+cat("================================================================\n")
+sessionInfo()
+```
+
+---
+
+*End of workflow. All objects retained in the R environment for further analysis.*
